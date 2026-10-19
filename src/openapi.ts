@@ -1,4 +1,5 @@
 import { config, explorerUrl } from './config';
+import { ALLOWED_FIELDS } from './utils/project';
 
 const json = (schema: object) => ({ 'application/json': { schema } });
 const ok = (description: string, schema: object = { type: 'object' }) => ({
@@ -6,6 +7,35 @@ const ok = (description: string, schema: object = { type: 'object' }) => ({
 });
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
+const errorRef = { $ref: '#/components/schemas/ErrorResponse' };
+
+/**
+ * `?fields=` query parameter shared by GET /contracts and GET /contracts/:id.
+ * Clients may request a subset of EscrowContract fields to reduce payload
+ * size.  `id` is always returned.  Use dot notation for milestone sub-fields
+ * (e.g. `milestones.amount`).  Unknown fields yield a 400 error.
+ */
+const fieldsParam = {
+  name: 'fields',
+  in: 'query',
+  required: false,
+  description:
+    'Comma-separated list of fields to include in the response. ' +
+    '`id` is always returned. Use `milestones.amount` style notation for ' +
+    'nested milestone fields. Unknown fields return 400. ' +
+    `Allowed values: ${ALLOWED_FIELDS.join(', ')}.`,
+  schema: {
+    type: 'string',
+    example: 'title,status,totalAmount',
+  },
+};
+
+const fieldsError = {
+  400: {
+    description: 'Invalid `?fields=` value. The response body lists valid field names.',
+    content: json(errorRef),
+  },
+};
 
 export const openapi = {
   openapi: '3.0.3',
@@ -15,7 +45,12 @@ export const openapi = {
     description:
       'Milestone-based escrow API for freelancers and clients. State mirrors the TalentTrust ' +
       `Soroban escrow contract on Stellar ${config.network} (${config.contractId}). ` +
-      `Explorer: ${explorerUrl()}. Data is held in memory and resets on redeploy.`,
+      `Explorer: ${explorerUrl()}. Data is held in memory and resets on redeploy.\n\n` +
+      '**Response compression**: The API compresses JSON responses ≥ 1 KB with gzip or Brotli ' +
+      'when the client sends an `Accept-Encoding` header. A `Vary: Accept-Encoding` header is ' +
+      'included on compressed responses.\n\n' +
+      '**Sparse fieldsets**: GET /contracts and GET /contracts/:id accept a `?fields=` query ' +
+      'parameter so clients can download only the fields they need.',
   },
   servers: [{ url: '/' }],
   tags: [{ name: 'System' }, { name: 'Contracts' }, { name: 'Reputation' }],
@@ -29,11 +64,19 @@ export const openapi = {
       get: {
         tags: ['Contracts'],
         summary: 'List escrow contracts',
+        description:
+          'Returns an array of contracts. Supports filtering by `status` or `party` address. ' +
+          'Use `?fields=` to request a sparse response — only the listed fields are included, ' +
+          'reducing payload size for list views.',
         parameters: [
           { name: 'status', in: 'query', schema: { type: 'string' } },
           { name: 'party', in: 'query', schema: { type: 'string' }, description: 'Client or freelancer address' },
+          fieldsParam,
         ],
-        responses: ok('Contracts', { type: 'object', properties: { data: { type: 'array', items: contractRef } } }),
+        responses: {
+          ...ok('Contracts', { type: 'object', properties: { data: { type: 'array', items: contractRef } } }),
+          ...fieldsError,
+        },
       },
       post: {
         tags: ['Contracts'],
@@ -59,7 +102,19 @@ export const openapi = {
       },
     },
     '/api/v1/contracts/{id}': {
-      get: { tags: ['Contracts'], summary: 'Get a contract', parameters: [idParam], responses: ok('Contract', contractRef) },
+      get: {
+        tags: ['Contracts'],
+        summary: 'Get a contract',
+        description:
+          'Returns a single contract by numeric ID. ' +
+          'Use `?fields=` to request only a subset of fields.',
+        parameters: [idParam, fieldsParam],
+        responses: {
+          ...ok('Contract', contractRef),
+          ...fieldsError,
+          404: { description: 'Contract not found', content: json(errorRef) },
+        },
+      },
     },
     '/api/v1/contracts/{id}/deposit': {
       post: {
@@ -145,6 +200,28 @@ export const openapi = {
           fundedAmount: { type: 'number' },
           releasedAmount: { type: 'number' },
           status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
+          reputationIssued: { type: 'boolean' },
+          dispute: {
+            type: 'object',
+            nullable: true,
+            properties: {
+              raisedBy: { type: 'string' },
+              reason: { type: 'string' },
+              openedAt: { type: 'string', format: 'date-time' },
+              freelancerBps: { type: 'integer' },
+              resolvedAt: { type: 'string', format: 'date-time' },
+            },
+          },
+          createdAt: { type: 'string', format: 'date-time' },
+          updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      ErrorResponse: {
+        type: 'object',
+        required: ['error', 'message'],
+        properties: {
+          error: { type: 'string', description: 'Machine-readable error code' },
+          message: { type: 'string', description: 'Human-readable description of the error' },
         },
       },
     },

@@ -1,9 +1,11 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { parseFieldSpec, project } from './utils/project';
 
 const startedAt = Date.now();
 
@@ -23,12 +25,40 @@ const id = (req: Request) => {
   return n;
 };
 
+/**
+ * Parse the `?fields=` query param.  Returns `null` when the param is absent
+ * (meaning "return all fields").  Throws {@link HttpError} 400 on invalid input.
+ */
+function parseFields(req: Request) {
+  const raw = req.query.fields;
+  if (typeof raw !== 'string') return null;
+  return parseFieldSpec(raw);
+}
+
 export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   const app = express();
   app.disable('x-powered-by');
   // CSP disabled so the /docs page can load Swagger UI from a CDN.
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
+
+  // Compression middleware: gzip/br for JSON responses ≥ 1 KB.
+  // Excluded for text/event-stream and when Cache-Control: no-transform is set.
+  app.use(
+    compression({
+      threshold: 1024, // bytes — skip compression for small responses
+      filter(req, res) {
+        // Honour Cache-Control: no-transform (RFC 7234 §5.2.1.6)
+        const cc = res.getHeader('Cache-Control');
+        if (typeof cc === 'string' && cc.includes('no-transform')) return false;
+        // Never compress streaming responses
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
+
   app.use(express.json({ limit: '100kb' }));
 
   app.get(
@@ -90,12 +120,14 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    wrap((req) => ({
-      data: store.list({
+    wrap((req) => {
+      const spec = parseFields(req);
+      const contracts = store.list({
         status: typeof req.query.status === 'string' ? req.query.status : undefined,
         party: typeof req.query.party === 'string' ? req.query.party : undefined,
-      }),
-    })),
+      });
+      return { data: contracts.map((c) => project(c, spec)) };
+    }),
   );
   v1.post(
     '/contracts',
@@ -103,7 +135,10 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
       res.status(201).json(store.create(req.body ?? {}));
     }),
   );
-  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
+  v1.get(
+    '/contracts/:id',
+    wrap((req) => project(store.get(id(req)), parseFields(req))),
+  );
   v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
   v1.post(
     '/contracts/:id/milestones/:index/release',
