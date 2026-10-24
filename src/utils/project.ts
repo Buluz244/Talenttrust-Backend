@@ -14,11 +14,16 @@ export const ALLOWED_FIELDS: readonly string[] = [
   'token',
   'milestones',
   'totalAmount',
+  'totalAmountUnits',
   'fundedAmount',
+  'fundedAmountUnits',
   'releasedAmount',
+  'releasedAmountUnits',
   'status',
   'reputationIssued',
   'dispute',
+  'chain',
+  'revision',
   'createdAt',
   'updatedAt',
 ] as const;
@@ -28,6 +33,7 @@ const ALLOWED_MILESTONE_FIELDS: readonly string[] = [
   'index',
   'title',
   'amount',
+  'amountUnits',
   'released',
 ] as const;
 

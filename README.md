@@ -26,14 +26,19 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?fields=`) / create escrow contracts |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?linked=true\|false`, `?fields=`) / create escrow contracts |
 | GET | `/api/v1/contracts/:id` | Get a contract (`?fields=`) |
+| PATCH | `/api/v1/contracts/:id` | Edit an unfunded contract; `{ "client": "G...", "title": "...", "milestones": [{ "title": "...", "amount": 150 }] }` |
+| DELETE | `/api/v1/contracts/:id` | Withdraw an unfunded contract; `{ "client": "G..." }` |
+| GET | `/api/v1/contracts/:id/revisions` | Get contract term revision history |
 | POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
 | POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
 | POST | `/api/v1/contracts/:id/dispute` | `{ "raisedBy": "G...", "reason": "..." }` |
 | POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
+| POST | `/api/v1/contracts/:id/link` | Link to on-chain escrow `{ "escrowId": "3" }` |
+| GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
 
 ## Sparse fieldsets
@@ -47,9 +52,10 @@ GET /api/v1/contracts/1?fields=milestones.amount
 ```
 
 Allowed top-level fields: `title`, `client`, `freelancer`, `token`, `milestones`, `totalAmount`,
-`fundedAmount`, `releasedAmount`, `status`, `reputationIssued`, `dispute`, `createdAt`, `updatedAt`.
+`totalAmountUnits`, `fundedAmount`, `fundedAmountUnits`, `releasedAmount`, `releasedAmountUnits`,
+`status`, `reputationIssued`, `dispute`, `chain`, `revision`, `createdAt`, `updatedAt`.
 Use dot notation for milestone sub-fields: `milestones.index`, `milestones.title`,
-`milestones.amount`, `milestones.released`. Unknown fields return `400 invalid_fields`.
+`milestones.amount`, `milestones.amountUnits`, `milestones.released`. Unknown fields return `400 invalid_fields`.
 
 ## Response compression
 
@@ -57,6 +63,24 @@ JSON responses larger than 1 KB are compressed with gzip or Brotli when the clie
 `Accept-Encoding`. A `Vary: Accept-Encoding` header is set on compressed responses. Responses
 are not compressed when `Cache-Control: no-transform` is present or the content type is
 `text/event-stream`.
+### Idempotency
+
+Every `POST` under `/api/v1` accepts an optional `Idempotency-Key` header (1-255 printable ASCII
+characters), following `draft-ietf-httpapi-idempotency-key-header`. Retrying a request with the same key
+and body replays the stored response with `Idempotent-Replayed: true` instead of applying it again.
+
+| Situation | Result |
+| --- | --- |
+| Same key, same body, first request finished | Stored status and body replayed, `Idempotent-Replayed: true` |
+| Same key, different body | `422 idempotency_key_reused` |
+| Same key while the first request is still running | `409 idempotency_request_in_progress`, `Retry-After: 1` |
+| Malformed key | `400 invalid_idempotency_key` |
+| No key | Current behaviour, unless `IDEMPOTENCY_REQUIRED=true` (`400 idempotency_key_required`) |
+
+Keys are scoped by method, path and authenticated principal (if `req.user.id` is set). Responses with
+status below 500 are kept for 24h (max 10,000 entries, LRU eviction); 5xx responses are not stored, so the
+client can retry. Storage is in-memory and per-instance; the `IdempotencyStore` interface in
+`src/idempotency.ts` allows a shared store later.
 
 ## Development
 
@@ -68,8 +92,22 @@ npm test
 npm run build && npm start
 ```
 
-Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+Configuration (all optional, see `.env.example`): `PORT`, `LOG_LEVEL` (debug|info|warn|error|silent, default info; silent in tests),
+`ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`, `STELLAR_RPC_URL`, `FRONTEND_URL`, `IDEMPOTENCY_REQUIRED`.
+
+Every request is assigned a correlation id. Send `X-Request-Id` (must match `^[A-Za-z0-9._-]{8,128}$`) and it is echoed back in the
+`X-Request-Id` response header and included in every error JSON body. Access logs are emitted as structured JSON (one line per request) and
+unexpected 500s are logged with a stack trace (never leaked to the client). Authorization, `x-api-key` and `Cookie` header values are redacted
+and request bodies are never logged.
+
+Standalone server timeouts (env, all optional): `KEEP_ALIVE_TIMEOUT_MS` (default 65000),
+`HEADERS_TIMEOUT_MS` (default 66000, must be > keep-alive), `REQUEST_TIMEOUT_MS` (default 30000).
+`SHUTDOWN_GRACE_MS` (default 10000) controls how long to wait for in-flight requests on shutdown.
+`PORT` is validated: non-integer or out-of-range (1–65535) values cause a fast fail with a clear message.
+
+On SIGTERM/SIGINT the server stops accepting connections, sets `Connection: close` on responses,
+returns `503 { status: 'draining' }` from `/health` while draining, waits for in-flight requests up to
+the grace deadline, then force-closes remaining sockets and exits.
 
 ## Deployment
 
